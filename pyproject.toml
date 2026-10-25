@@ -70,6 +70,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+omni = [
+    # Preview of Omni PRs #8946 and #8949; use upstream once merged.
+    "vllm-omni @ git+https://github.com/WindChimeRan/vllm-omni@c2b3c229198defa35390bbdf71f7982cd77b223d",
+]
 build = [
     # Native Metal extension source builds
     "cmake>=3.25; platform_system == 'Darwin' and platform_machine == 'arm64'",
@@ -85,6 +89,7 @@ dev = [
     "ruff==0.16.0",
     "mypy>=1.19.1",
 ]
+all = ["vllm-metal[build,omni,dev]"]
 
 [project.urls]
 Homepage = "https://github.com/vllm-project/vllm-metal"
@@ -92,6 +97,9 @@ Repository = "https://github.com/vllm-project/vllm-metal"
 Issues = "https://github.com/vllm-project/vllm-metal/issues"
 
 # vLLM Plugin Entry Points
+[project.entry-points."vllm_omni.platform_plugins"]
+metal = "vllm_metal:register_omni"
+
 [project.entry-points."vllm.platform_plugins"]
 metal = "vllm_metal:register"
 
