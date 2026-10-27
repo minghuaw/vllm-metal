@@ -13,7 +13,6 @@ Key contracts:
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from importlib.metadata import entry_points
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypeAlias, cast
 
 import mlx.core as mx
@@ -45,7 +44,10 @@ from vllm.v1.outputs import (
     LogprobsTensors,
     ModelRunnerOutput,
 )
-from vllm.v1.sample.logits_processor import LOGITSPROCS_GROUP
+from vllm.v1.sample.logits_processor import (
+    LogitsProcessor,
+    cached_load_custom_logitsprocs,
+)
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.worker.gpu.kv_connector import (
     NO_OP_KV_CONNECTOR,
@@ -143,6 +145,27 @@ if TYPE_CHECKING:
     from vllm_metal.v1.kv_offload.connector import MetalOffloadingConnector
 
 logger = init_logger(__name__)
+
+
+def _build_custom_logitsprocs(vllm_config: VllmConfig) -> list[LogitsProcessor]:
+    """Instantiate the processors named by ``--logits-processors``.
+
+    vLLM loads the FQCNs into classes; metal instantiates them once per model
+    runner. The torch sampler bridge runs on CPU (see
+    ``SamplingBatch.SAMPLER_DEVICE``), so processors place their tensors there.
+    """
+    names = tuple(vllm_config.model_config.logits_processors or ())
+    if not names:
+        return []
+    procs = [
+        ctor(vllm_config, torch.device("cpu"), False)
+        for ctor in cached_load_custom_logitsprocs(names)
+    ]
+    logger.info(
+        "vllm-metal: loaded custom logits processor(s): %s",
+        ", ".join(type(p).__name__ for p in procs),
+    )
+    return procs
 
 
 SchedulerMemoryReportingMode: TypeAlias = Literal[
@@ -382,12 +405,12 @@ class MetalModelRunner:
         Args:
             vllm_config: vLLM configuration
         """
-        if vllm_config.model_config.logits_processors or entry_points(
-            group=LOGITSPROCS_GROUP
-        ):
-            raise NotImplementedError(
-                "vllm-metal does not support custom logits processors."
-            )
+        # Custom logits processors: vLLM resolves the FQCNs passed via
+        # --logits-processors; instantiate them once per runner so per-request
+        # state and the processor's own caches survive across steps.
+        self._custom_logitsprocs: list[LogitsProcessor] = _build_custom_logitsprocs(
+            vllm_config
+        )
 
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
@@ -1852,6 +1875,7 @@ class MetalModelRunner:
         sampling = SamplingShape(
             native_greedy=(
                 not states_missing
+                and not self._custom_logitsprocs
                 and SamplingBatch.params_allow_native_greedy(decode_params)
             ),
             native_random=(
@@ -2033,6 +2057,7 @@ class MetalModelRunner:
                     output_tokens_list,
                     vocab_size=vocab_size,
                     generators=generators,
+                    logitsprocs=self._custom_logitsprocs,
                 )
                 plain_result = sample_from_logits(
                     plain_logits, plain_batch, self._sampler
@@ -2053,6 +2078,7 @@ class MetalModelRunner:
                 num_decode_tokens,
                 self._sampler,
                 vocab_size=vocab_size,
+                logitsprocs=self._custom_logitsprocs,
             )
             decode_token_ids = [[token_id] for token_id in decode_result.token_ids]
             decode_logprobs = decode_result.logprobs
@@ -2063,6 +2089,7 @@ class MetalModelRunner:
             num_decode_segments,
             self._sampler,
             vocab_size=vocab_size,
+            logitsprocs=self._custom_logitsprocs,
         )
 
         # ---- update decode state ----

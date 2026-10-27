@@ -14,7 +14,11 @@ import torch
 from vllm.sampling_params import SamplingParams
 from vllm.utils.torch_utils import make_tensor_with_pad
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors, SamplerOutput
-from vllm.v1.sample.logits_processor import LogitsProcessors
+from vllm.v1.sample.logits_processor import (
+    BatchUpdate,
+    LogitsProcessor,
+    LogitsProcessors,
+)
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
@@ -54,6 +58,7 @@ class SamplingBatch:
         *,
         vocab_size: int,
         generators: dict[int, torch.Generator] | None = None,
+        logitsprocs: Sequence[LogitsProcessor] = (),
     ) -> None:
         batch_size = len(sampling_params_list)
         if len(prompt_token_id_lists) != batch_size:
@@ -72,6 +77,7 @@ class SamplingBatch:
         self.sampling_params_list = list(sampling_params_list)
         self.prompt_token_id_lists = list(prompt_token_id_lists)
         self.output_token_id_lists = list(output_token_id_lists)
+        self.custom_logitsprocs = list(logitsprocs)
         self.vocab_size = vocab_size
         self.generators = {} if generators is None else generators
         self.all_greedy = all(
@@ -168,6 +174,9 @@ class SamplingBatch:
 
     def can_use_native_greedy(self) -> bool:
         """Return whether MLX argmax matches the requested sampling behavior."""
+        if self.custom_logitsprocs:
+            # A logits processor rewrites the logits; MLX argmax would skip it.
+            return False
         return self.params_allow_native_greedy(self.sampling_params_list)
 
     @staticmethod
@@ -549,11 +558,10 @@ class SamplingBatch:
         return tensors
 
     def _make_logitsprocs(self) -> LogitsProcessors:
+        procs: list[LogitsProcessor] = list(self.custom_logitsprocs)
         min_p_vals = [sp.min_p for sp in self.sampling_params_list]
-        if not any(min_p > 0.0 for min_p in min_p_vals):
-            return _EMPTY_LOGITSPROCS
-        return LogitsProcessors(
-            [
+        if any(min_p > 0.0 for min_p in min_p_vals):
+            procs.append(
                 BatchMinPLogitsProcessor(
                     torch.tensor(
                         min_p_vals,
@@ -561,11 +569,39 @@ class SamplingBatch:
                         device=self.SAMPLER_DEVICE,
                     )
                 )
-            ]
+            )
+        if not procs:
+            return _EMPTY_LOGITSPROCS
+        return LogitsProcessors(procs)
+
+    def _update_custom_logitsprocs(self) -> None:
+        """Publish this step's requests to the custom processors.
+
+        The batching contract lets an added request replace one with the same
+        index, so every step re-adds all rows. That keeps the processors'
+        references to ``output_tok_ids`` fresh even though the runner hands
+        this batch step-local token-id copies.
+        """
+        if not self.custom_logitsprocs:
+            return
+        added = [
+            (
+                idx,
+                params,
+                self.prompt_token_id_lists[idx],
+                self.output_token_id_lists[idx],
+            )
+            for idx, params in enumerate(self.sampling_params_list)
+        ]
+        update = BatchUpdate(
+            batch_size=len(added), removed=[], added=added, moved=[]
         )
+        for proc in self.custom_logitsprocs:
+            proc.update_state(update)
 
     def make_sampling_metadata(self) -> SamplingMetadata:
         """Create vLLM ``SamplingMetadata`` for this batch."""
+        self._update_custom_logitsprocs()
         (
             frequency_penalties,
             presence_penalties,
@@ -670,6 +706,7 @@ def sample_decode_tokens(
     sampler: Sampler,
     *,
     vocab_size: int,
+    logitsprocs: Sequence[LogitsProcessor] = (),
 ) -> _SamplingResult:
     """Sample one token per decode request from evaluated logits.
 
@@ -706,6 +743,7 @@ def sample_decode_tokens(
         output_tokens_list,
         vocab_size=vocab_size,
         generators=generators,
+        logitsprocs=logitsprocs,
     )
     return sample_from_logits(decode_logits, batch, sampler)
 
@@ -718,6 +756,7 @@ def sample_prefill_tokens(
     sampler: Sampler,
     *,
     vocab_size: int,
+    logitsprocs: Sequence[LogitsProcessor] = (),
 ) -> _SamplingResult:
     """Sample from the last logit position of each completed prefill.
 
@@ -765,6 +804,7 @@ def sample_prefill_tokens(
             for j, pr in enumerate(final_reqs)
             if pr.generator is not None
         },
+        logitsprocs=logitsprocs,
     )
     result = sample_from_logits(last_logits, batch, sampler)
     if len(final_reqs) == len(prefill_reqs):
